@@ -255,14 +255,10 @@ void Reset208(uint8_t *Buffer)
     Buffer[i] = 0x00;
   }
 
-  // Generate a new UUID.
-  // The original author of the code suggested that this is necessary
-  // to make the printer recognize the cartridge as new.
-  // This is not truly random, but it does change the UUID.
-  Buffer[169] = Buffer[169] + Buffer[198];
-  for (int i = 170; i < 199; i++)
+  // Generate a new pseudo-random UUID.
+  for (int i = 169; i < 199; i++)
   {
-    Buffer[i] = Buffer[i] + Buffer[i - 1];
+    Buffer[i] = random(256);
   }
 
   // Clear the bytes after the UUID.
@@ -275,6 +271,21 @@ void Reset208(uint8_t *Buffer)
   uint16_t checksum = crc16(Buffer, 206);
   Buffer[206] = (checksum >> 8) & 0xFF;
   Buffer[207] = checksum & 0xFF;
+}
+
+void processDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint16_t dataSize, void (*resetFunc)(uint8_t*)) {
+    bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
+    delay(10);
+    if (bRet == false) return;
+
+    resetFunc(Buffer);
+
+    if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, regAddr2, REG_ADDR_3_RW, BufferPlus4, dataSize)) return;
+    delay(10);
+
+    read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
+    delay(10);
+    Serial.println("");
 }
 
 void ResetCartridge(uint16_t slaveAddress, const char *colorName)
@@ -292,49 +303,19 @@ void ResetCartridge(uint16_t slaveAddress, const char *colorName)
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 56 bytes register, first one");
-  bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_56_1, REG_ADDR_3_RW, Buffer, DATA_BLOCK_56_SIZE); // Before
-  delay(10);
-  if (bRet == false)
-    return;
-  Reset56(Buffer);
-  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, REG_ADDR_2_56_1, REG_ADDR_3_RW, BufferPlus4, DATA_BLOCK_56_SIZE))
-    return;
-  delay(10);
-  read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_56_1, REG_ADDR_3_RW, Buffer, DATA_BLOCK_56_SIZE); // After
-  delay(10);
-  Serial.println("");
+  processDataBlock(slaveAddress, REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, Reset56);
 
   Serial.print(colorName);
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 56 bytes register, second one");
-  bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_56_2, REG_ADDR_3_RW, Buffer, DATA_BLOCK_56_SIZE); // Before
-  delay(10);
-  if (bRet == false)
-    return;
-  Reset56(Buffer);
-  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, REG_ADDR_2_56_2, REG_ADDR_3_RW, BufferPlus4, DATA_BLOCK_56_SIZE))
-    return;
-  delay(10);
-  read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_56_2, REG_ADDR_3_RW, Buffer, DATA_BLOCK_56_SIZE); // After
-  delay(10);
-  Serial.println("");
+  processDataBlock(slaveAddress, REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, Reset56);
 
   Serial.print(colorName);
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 208 bytes register");
-  bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_208, REG_ADDR_3_RW, Buffer, DATA_BLOCK_208_SIZE);
-  delay(10);
-  if (bRet == false)
-    return;
-  Reset208(Buffer);
-  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, REG_ADDR_2_208, REG_ADDR_3_RW, BufferPlus4, DATA_BLOCK_208_SIZE))
-    return;
-  delay(10);
-  read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_208, REG_ADDR_3_RW, Buffer, DATA_BLOCK_208_SIZE);
-  delay(10);
-  Serial.println("");
+  processDataBlock(slaveAddress, REG_ADDR_2_208, DATA_BLOCK_208_SIZE, Reset208);
 }
 
 void ResetBlack()
@@ -342,9 +323,9 @@ void ResetBlack()
   ResetCartridge(BLACK_CHIP_ADDRESS, "Black");
 }
 
-void ResetBlue()
+void ResetCyan()
 {
-  ResetCartridge(CYAN_CHIP_ADDRESS, "Blue");
+  ResetCartridge(CYAN_CHIP_ADDRESS, "Cyan");
 }
 
 void ResetMagenta()
@@ -360,7 +341,13 @@ void ResetYellow()
 void detectAndReset()
 {
   const uint16_t addresses[] = {BLACK_CHIP_ADDRESS, CYAN_CHIP_ADDRESS, MAGENTA_CHIP_ADDRESS, YELLOW_CHIP_ADDRESS};
-  const char *colors[] = {"Black", "Blue", "Magenta", "Yellow"};
+  const char *colors[] = {"Black", "Cyan", "Magenta", "Yellow"};
+  const uint32_t ledColors[] = {
+    pixels.Color(255, 255, 255), // White for Black
+    pixels.Color(0, 255, 255),   // Cyan
+    pixels.Color(255, 0, 255),   // Magenta
+    pixels.Color(255, 255, 0)    // Yellow
+  };
   bool found = false;
 
   for (int i = 0; i < 4; i++)
@@ -377,15 +364,7 @@ void detectAndReset()
       Serial.print(colors[i]);
       Serial.println(" cartridge. Starting reset.");
 
-      if (strcmp(colors[i], "Black") == 0) {
-        pixels.setPixelColor(0, pixels.Color(255, 255, 255)); // White
-      } else if (strcmp(colors[i], "Blue") == 0) { // Cyan
-        pixels.setPixelColor(0, pixels.Color(0, 255, 255)); // Cyan
-      } else if (strcmp(colors[i], "Magenta") == 0) {
-        pixels.setPixelColor(0, pixels.Color(255, 0, 255)); // Magenta
-      } else if (strcmp(colors[i], "Yellow") == 0) {
-        pixels.setPixelColor(0, pixels.Color(255, 255, 0)); // Yellow
-      }
+      pixels.setPixelColor(0, ledColors[i]);
       pixels.show();
 
       ResetCartridge(addresses[i], colors[i]);
@@ -427,6 +406,8 @@ void setup()
   Serial.println("-------------------------------------------");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(34, INPUT);
+  randomSeed(analogRead(34));
 
   pixels.begin();
   pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // Green
