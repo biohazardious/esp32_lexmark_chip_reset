@@ -19,19 +19,12 @@ This project provides a simple and effective solution for resetting the toner ch
 
 This tool is designed to work with printers that use toner cartridges with the TI046B1 chip. The following Lexmark printers are known to be compatible:
 
-- CS310dn
-- MS310d
-- MS310dn
-- MS312dn
-- MS315dn
-- MS410d
-- MS410dn
-- MS415dn
-- MS510dn
-- MS610de
-- MS610dtn
-- MS610dn
-- MS610dte
+- CX310
+- CX310dn
+- CX410
+- CX510
+- CX410dte
+- CX510de
 
 It may also be compatible with other Lexmark, Dell, and Konica Minolta printers that use the same toner chip.
 
