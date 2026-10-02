@@ -126,7 +126,7 @@ bool checkI2CResult(uint8_t nRet, const char *operation)
  * @brief Reads data from a 10-bit I2C address using a repeated start.
  * Rewritten for ESP32 Wire library.
  */
-bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegisterByte, uint8_t secondRegisterByte, uint8_t thirdRegisterByte, uint8_t *destinationBuffer, uint16_t readSize)
+bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegisterByte, uint8_t secondRegisterByte, uint8_t thirdRegisterByte, uint8_t *destinationBuffer, uint16_t readSize, bool verbose = true)
 {
 
   // 10-bit address splitting logic
@@ -161,7 +161,9 @@ bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegister
   // Check if we got all the bytes we asked for
   if (bytesRead == 0)
   {
-    Serial.println("I2C error while trying to read from the slave : no data (no ACK, timeout or bus error).");
+    // Not verbose: used to probe for chips, an empty slot is expected then
+    if (verbose)
+      Serial.println("I2C error while trying to read from the slave : no data (no ACK, timeout or bus error).");
     return false;
   }
 
@@ -179,6 +181,8 @@ bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegister
   Wire.readBytes(destinationBuffer, readSize);
 
   // --- Printing ---
+  if (!verbose)
+    return true;
   Serial.print("uint8_t destinationBuffer[");
   Serial.print(readSize);
   Serial.print("] = {");
@@ -236,9 +240,9 @@ bool write_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegiste
 // They are copied directly from the original .ino file
 // -----------------------------------------------------------------
 
-bool readChip(uint16_t slaveAddress, uint16_t address, uint8_t *destination, uint16_t size)
+bool readChip(uint16_t slaveAddress, uint16_t address, uint8_t *destination, uint16_t size, bool verbose = true)
 {
-  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, address & 0xFF, address >> 8, destination, size);
+  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, address & 0xFF, address >> 8, destination, size, verbose);
   delay(10);
   return bRet;
 }
@@ -534,6 +538,49 @@ void dumpDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint8_t regAddr3, ui
 }
 
 /**
+ * @brief Prints the whole 2 KB address space (0x000-0x7FF) of every chip that
+ * answers as an addressed hex dump, without writing. Meant to be copied from the
+ * serial monitor and shared, e.g. to compare chips of different regions.
+ */
+void dumpFullCartridges()
+{
+  const uint16_t addresses[] = {BLACK_CHIP_ADDRESS, CYAN_CHIP_ADDRESS, MAGENTA_CHIP_ADDRESS, YELLOW_CHIP_ADDRESS};
+  const char *colors[] = {"Black", "Cyan", "Magenta", "Yellow"};
+  const uint16_t CHIP_MEMORY_SIZE = 0x800;
+  const uint16_t CHUNK_SIZE = 0x80;
+  bool found = false;
+
+  for (int i = 0; i < 4; i++)
+  {
+    if (!readChip(addresses[i], (REG_ADDR_3_SERIAL << 8) | REG_ADDR_2_SERIAL, Buffer, SERIAL_NUMBER_SIZE, false))
+      continue;
+    found = true;
+    Buffer[SERIAL_NUMBER_SIZE] = 0x00;
+    Serial.printf("=== FULL DUMP %s (0x%X) serial %s ===\n", colors[i], addresses[i], (char *)Buffer);
+
+    for (uint16_t chunk = 0; chunk < CHIP_MEMORY_SIZE; chunk += CHUNK_SIZE)
+    {
+      bool bRet = readChip(addresses[i], chunk, Buffer, CHUNK_SIZE, false);
+      for (uint16_t line = 0; line < CHUNK_SIZE; line += 16)
+      {
+        Serial.printf("%04X:", chunk + line);
+        if (!bRet)
+        {
+          Serial.println(" read failed");
+          continue;
+        }
+        for (uint16_t j = 0; j < 16; j++)
+          Serial.printf(" %02X", Buffer[line + j]);
+        Serial.println();
+      }
+    }
+    Serial.printf("=== END FULL DUMP %s ===\n", colors[i]);
+  }
+  if (!found)
+    Serial.println("No cartridge detected.");
+}
+
+/**
  * @brief Dumps the known blocks of every cartridge chip that answers, without writing.
  */
 void dumpCartridges()
@@ -630,6 +677,7 @@ bool writeBlockCommand(uint16_t slaveAddress, uint16_t address, const char *hex)
 /**
  * @brief Handles one serial command line:
  *   d                         dump all known blocks of the connected chip(s)
+ *   f                         full 2 KB hex dump of the connected chip(s)
  *   r <addr> <reg2> <reg3> <len>  raw read, all values hex (e.g. "r 2 20 0 38")
  *   w <addr> <block> <data>   write one whole block (20, 58, 90 or 160) from hex data, verified
  */
@@ -645,6 +693,10 @@ void handleSerialCommand()
   if (line == "d")
   {
     dumpCartridges();
+  }
+  else if (line == "f")
+  {
+    dumpFullCartridges();
   }
   else if (sscanf(line.c_str(), "r %x %x %x %x", &addr, &reg2, &reg3, &len) == 4)
   {
@@ -662,7 +714,7 @@ void handleSerialCommand()
   }
   else
   {
-    Serial.println("Commands : d | r <addr> <reg2> <reg3> <len> | w <addr> <block> <data> (hex)");
+    Serial.println("Commands : d | f | r <addr> <reg2> <reg3> <len> | w <addr> <block> <data> (hex)");
   }
   Serial.println("End command.");
 }

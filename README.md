@@ -90,8 +90,18 @@ The firmware accepts commands on the serial port (115200 baud, newline terminate
 | Command | Description |
 | ------- | ----------- |
 | `d` | Dump the serial number, both 56-byte blocks, the 208-byte block and the chip ID copy of every connected chip, with CRC check. Read-only. |
+| `f` | Full hex dump of the whole 2 KB address space (`0x000`-`0x7FF`) of every connected chip, 16 bytes per line. Read-only. |
 | `r <addr> <lo> <hi> <len>` | Raw read of `len` bytes at chip address `hi:lo` from the chip at I2C address `addr`, e.g. `r 1 40 4 c` reads the serial number of a black chip. Read-only. |
 | `w <addr> <block> <data>` | Write one whole block (`20`, `58`, `90` or `160`) from hex data and verify it by reading it back. Blocks with a CRC must carry a valid one. Meant for restoring a chip from a saved dump; use with care. |
+
+### Sharing a chip dump
+
+To help investigate a cartridge (for example to compare chips of different regions or printer models), you can share a full dump of its chip. It only reads the chip, nothing is written.
+
+1.  Flash the firmware and connect the cartridge chip as described above.
+2.  Open a serial monitor at 115200 baud (for example the PlatformIO *Serial Monitor*, or the Arduino IDE Serial Monitor with line ending set to *Newline*).
+3.  Type `f` and press Enter.
+4.  Copy everything from `=== FULL DUMP` to `=== END FULL DUMP` and paste it into the GitHub issue, together with the printer model, the cartridge part number and region, and what the printer reports for it.
 
 ## Chip memory map
 
