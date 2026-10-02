@@ -4,3 +4,13 @@
 .vscode/launch.json
 .vscode/ipch
 *.bak
+
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.codex/
+.opencode/
+.wolf/
+.claude/
+# Chip dumps and test scripts (local only)
+dumps/
