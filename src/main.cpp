@@ -4,8 +4,24 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 
-#define BUTTON_PIN 12
-#define LED_PIN 13
+// Pins are set per board in platformio.ini (build_flags), defaults match the LOLIN S2 Mini
+#ifndef BUTTON_PIN
+#define BUTTON_PIN 9
+#endif
+// Level the button pin reads while pressed: HIGH for a button to 3.3V with a pull-down,
+// LOW for a button to GND (the internal pull-up is used then)
+#ifndef BUTTON_ACTIVE_LEVEL
+#define BUTTON_ACTIVE_LEVEL HIGH
+#endif
+#ifndef LED_PIN
+#define LED_PIN 11
+#endif
+#ifndef I2C_SDA_PIN
+#define I2C_SDA_PIN 33
+#endif
+#ifndef I2C_SCL_PIN
+#define I2C_SCL_PIN 35
+#endif
 #define NUM_PIXELS 1
 
 Adafruit_NeoPixel pixels(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -31,6 +47,12 @@ const uint16_t SERIAL_NUMBER_SIZE = 12;
 const uint16_t DATA_BLOCK_56_SIZE = 56;
 const uint16_t DATA_BLOCK_208_SIZE = 208;
 
+// Copy of the 6-byte chip ID (factory area 0x400) at 16-bit chip address 0x160.
+// The printer erases it to 0xFF when the cartridge reaches end of life.
+const uint16_t CHIP_ID_COPY_ADDR = 0x160;
+const uint16_t CHIP_ID_SIZE = 6;
+const uint16_t CHIP_ID_COPY_SIZE = 16;
+
 // Global buffer setup, identical to the original
 uint8_t BufferPlus4[1024 + 4];
 // Buffer pointer offset by 4 bytes
@@ -51,6 +73,53 @@ uint16_t crc16(const uint8_t *data_p, uint8_t length)
     crc = (crc << 8) ^ ((uint16_t)(x << 12)) ^ ((uint16_t)(x << 5)) ^ ((uint16_t)x);
   }
   return crc;
+}
+
+/**
+ * @brief Checks the CRC16 stored big-endian in the last two bytes of a data block
+ */
+bool hasValidCrc(const uint8_t *block, uint16_t blockSize)
+{
+  uint16_t stored = ((uint16_t)block[blockSize - 2] << 8) | block[blockSize - 1];
+  uint16_t computed = crc16(block, blockSize - 2);
+  if (computed != stored)
+  {
+    Serial.printf("CRC mismatch : stored 0x%04X, computed 0x%04X\n", stored, computed);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Translates a Wire.endTransmission() result code into a log message.
+ * @return true only if the transmission succeeded (code 0)
+ */
+bool checkI2CResult(uint8_t nRet, const char *operation)
+{
+  switch (nRet)
+  {
+  case 0:
+    return true;
+  case 1:
+    Serial.printf("I2C error while trying to %s the slave : Wire buffer is too small\n", operation);
+    break;
+  case 2:
+    Serial.printf("I2C error while trying to %s the slave : address not acknowledged - is it connected ?\n", operation);
+    break;
+  case 3:
+    Serial.printf("I2C error while trying to %s the slave : NACK during data - are the 10 address bits and the written values correct ?\n", operation);
+    break;
+  case 4:
+    Serial.printf("I2C error while trying to %s the slave : bus error - is the wiring correct ?\n", operation);
+    break;
+  case 5:
+    Serial.printf("I2C error while trying to %s the slave : timeout\n", operation);
+    break;
+  default:
+    Serial.printf("I2C error while trying to %s the slave : unknown error code %u\n", operation, nRet);
+    break;
+  }
+  return false;
 }
 
 /**
@@ -79,40 +148,20 @@ bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegister
   Wire.beginTransmission(SevenBits_compat_address);
   Wire.write(txBuffer, 4);
 
-  // Send a REPEATED START (false = do not send stop)
-  uint8_t nRet = Wire.endTransmission(false);
-
-  // Error handling
-  if (nRet == 1)
-  {
-    Serial.println("Error occured wile trying to write to the slave : TWI class's buffer is too small");
+  // Send a REPEATED START (false = do not send stop).
+  // On ESP32 this only queues the write; the actual transfer (and any
+  // address/NACK error) happens inside requestFrom() below.
+  if (!checkI2CResult(Wire.endTransmission(false), "write to"))
     return false;
-  }
-  else if (nRet == 2)
-  {
-    Serial.println("Error occured wile trying to write to the slave : Slave's address not acknowldged (begning only) - is it connected ?");
-    return false;
-  }
-  else if (nRet == 3)
-  {
-    Serial.println("Error occured wile trying to write to the slave :");
-    Serial.println("Slaves's begining of address acknowledged but NACK encountered during the following writes - are all of the 10 bits of slave's address correct ? Are the writes value are meaningful to the slave ?");
-    return false;
-  }
-  else if (nRet == 4)
-  {
-    Serial.println("I2C protocol error occured wile trying to write to the slave. Is the wiring correct ? TWI Initialisation ?");
-    return false;
-  }
 
   // --- Step 2: Read the data ---
   // Request `readSize` bytes and send a STOP (true) at the end
-  uint16_t bytesRead = Wire.requestFrom(SevenBits_compat_address, (uint8_t)readSize, (uint8_t)true);
+  size_t bytesRead = Wire.requestFrom((uint16_t)SevenBits_compat_address, (size_t)readSize, true);
 
   // Check if we got all the bytes we asked for
   if (bytesRead == 0)
   {
-    Serial.println("Error occured wile trying to read from the slave.");
+    Serial.println("I2C error while trying to read from the slave : no data (no ACK, timeout or bus error).");
     return false;
   }
 
@@ -175,33 +224,9 @@ bool write_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegiste
   Wire.write(contentBuffer, 4 + writeSize);
 
   // Send a STOP (true = send stop)
-  uint8_t nRet = Wire.endTransmission(true);
+  if (!checkI2CResult(Wire.endTransmission(true), "write to"))
+    return false;
 
-  // Error handling
-  if (nRet == 1)
-  {
-    Serial.println("Error occured wile trying to address the slave : TWI class's buffer is too small");
-    return false;
-  }
-  else if (nRet == 2)
-  {
-    Serial.println("Error occured wile trying to address the slave : Slave's address not acknowldged (begning only) - is it connected ?");
-    return false;
-  }
-  else if (nRet == 3)
-  {
-    Serial.println("Error occured wile trying to address the slave :");
-    Serial.println("Slaves's begining of address acknowledged but NACK encountered during the following writes - are all of the 10 bits of slave's address correct ?");
-    Serial.println("Are the writes value are meaningful to the slave ?");
-    return false;
-  }
-  else if (nRet == 4)
-  {
-    Serial.println("I2C protocol error occured wile trying to address the slave. Is the wiring correct ? TWI Initialisation ?");
-    return false;
-  }
-
-  // else :
   Serial.println("Write OK");
   return true;
 }
@@ -210,6 +235,41 @@ bool write_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegiste
 // ALL FUNCTIONS BELOW ARE PLATFORM-INDEPENDENT
 // They are copied directly from the original .ino file
 // -----------------------------------------------------------------
+
+bool readChip(uint16_t slaveAddress, uint16_t address, uint8_t *destination, uint16_t size)
+{
+  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, address & 0xFF, address >> 8, destination, size);
+  delay(10);
+  return bRet;
+}
+
+/**
+ * @brief Checks whether the printer has marked the cartridge as end of life.
+ * When a cartridge is used up, the printer overwrites the model fields of the
+ * 56-byte blocks (bytes 21-24) and the chip ID copy at 0x160 with 0xFF, and it
+ * keeps the cartridge as "End of Life" in its own memory, keyed by the
+ * read-only serial number. A reset cannot undo that, and resetting such a chip
+ * makes the printer report it as "Missing or Defective".
+ * @return false if the markers could not be read
+ */
+bool readEndOfLifeMarkers(uint16_t slaveAddress, bool &endOfLife)
+{
+  uint8_t block56[DATA_BLOCK_56_SIZE];
+  if (!readChip(slaveAddress, REG_ADDR_2_56_1, block56, DATA_BLOCK_56_SIZE))
+    return false;
+  bool modelMarked = block56[20] == 0xFF && block56[21] == 0xFF && block56[22] == 0xFF && block56[23] == 0xFF;
+
+  uint8_t idCopy[CHIP_ID_COPY_SIZE];
+  if (!readChip(slaveAddress, CHIP_ID_COPY_ADDR, idCopy, CHIP_ID_COPY_SIZE))
+    return false;
+  bool idMarked = true;
+  for (int i = 0; i < CHIP_ID_SIZE; i++)
+    if (idCopy[i] != 0xFF)
+      idMarked = false;
+
+  endOfLife = modelMarked || idMarked;
+  return true;
+}
 
 void Reset56(uint8_t *Buffer)
 {
@@ -273,49 +333,108 @@ void Reset208(uint8_t *Buffer)
   Buffer[207] = checksum & 0xFF;
 }
 
-void processDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint16_t dataSize, void (*resetFunc)(uint8_t*)) {
+bool processDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint16_t dataSize, void (*resetFunc)(uint8_t*)) {
     bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
     delay(10);
-    if (bRet == false) return;
+    if (bRet == false) return false;
+
+    // Never rewrite a block that was not read cleanly: the reset would stamp
+    // a fresh, valid CRC on top of corrupted data.
+    if (!hasValidCrc(Buffer, dataSize)) {
+        Serial.println("Read data failed CRC check, aborting without writing.");
+        return false;
+    }
 
     resetFunc(Buffer);
 
-    if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, regAddr2, REG_ADDR_3_RW, BufferPlus4, dataSize)) return;
+    // Keep a copy of what we write, the verification read overwrites Buffer
+    uint8_t expected[DATA_BLOCK_208_SIZE];
+    memcpy(expected, Buffer, dataSize);
+
+    if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, regAddr2, REG_ADDR_3_RW, BufferPlus4, dataSize)) return false;
     delay(10);
 
-    read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
+    bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
     delay(10);
+    if (bRet == false) return false;
+
+    if (memcmp(expected, Buffer, dataSize) != 0) {
+        Serial.println("Verification failed : read-back data differs from written data.");
+        return false;
+    }
+    Serial.println("Verify OK");
     Serial.println("");
+    return true;
 }
 
-void ResetCartridge(uint16_t slaveAddress, const char *colorName)
+enum ResetResult
+{
+  RESET_OK,
+  RESET_FAILED,
+  RESET_END_OF_LIFE,
+};
+
+/**
+ * @brief Resets all data blocks of one cartridge.
+ * Stops at the first failing block so a broken transfer is not followed by more writes.
+ * Writes nothing to a cartridge the printer has marked as end of life.
+ * @return RESET_OK only if every block was written and verified
+ */
+ResetResult ResetCartridge(uint16_t slaveAddress, const char *colorName)
 {
   bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_SERIAL, REG_ADDR_3_SERIAL, Buffer, SERIAL_NUMBER_SIZE);
   delay(10);
   if (bRet == false)
-    return;
+    return RESET_FAILED;
   Buffer[SERIAL_NUMBER_SIZE] = 0x00;
   Serial.print(colorName);
   Serial.print(" serial number : ");
   Serial.println((char *)Buffer);
 
+  bool endOfLife;
+  if (!readEndOfLifeMarkers(slaveAddress, endOfLife))
+    return RESET_FAILED;
+  if (endOfLife)
+  {
+    Serial.println("This cartridge has reached END OF LIFE: the printer keeps it as empty, keyed by its serial number.");
+    Serial.println("A reset cannot change that and would make the printer report it as defective. Nothing was written.");
+    return RESET_END_OF_LIFE;
+  }
+
   Serial.print(colorName);
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 56 bytes register, first one");
-  processDataBlock(slaveAddress, REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, Reset56);
+  if (!processDataBlock(slaveAddress, REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, Reset56))
+    return RESET_FAILED;
 
   Serial.print(colorName);
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 56 bytes register, second one");
-  processDataBlock(slaveAddress, REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, Reset56);
+  if (!processDataBlock(slaveAddress, REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, Reset56))
+    return RESET_FAILED;
 
   Serial.print(colorName);
   Serial.print(", (0x");
   Serial.print(slaveAddress, HEX);
   Serial.println("), 208 bytes register");
-  processDataBlock(slaveAddress, REG_ADDR_2_208, DATA_BLOCK_208_SIZE, Reset208);
+  if (!processDataBlock(slaveAddress, REG_ADDR_2_208, DATA_BLOCK_208_SIZE, Reset208))
+    return RESET_FAILED;
+  return RESET_OK;
+}
+
+void blinkLed(uint32_t color, int times, uint32_t intervalMs)
+{
+  for (int i = 0; i < times; i++)
+  {
+    pixels.setPixelColor(0, color);
+    pixels.show();
+    delay(intervalMs);
+    pixels.setPixelColor(0, pixels.Color(0, 0, 0)); // Off
+    pixels.show();
+    delay(intervalMs);
+  }
 }
 
 void ResetBlack()
@@ -348,8 +467,6 @@ void detectAndReset()
     pixels.Color(255, 0, 255),   // Magenta
     pixels.Color(255, 255, 0)    // Yellow
   };
-  bool found = false;
-
   for (int i = 0; i < 4; i++)
   {
     Serial.print("Pinging address 0x");
@@ -359,7 +476,6 @@ void detectAndReset()
     // Try to read 1 byte to see if a chip is present.
     if (read_TI046B1_register(addresses[i], REG_ADDR_1, REG_ADDR_2_SERIAL, REG_ADDR_3_SERIAL, Buffer, 1))
     {
-      found = true;
       Serial.print("Detected ");
       Serial.print(colors[i]);
       Serial.println(" cartridge. Starting reset.");
@@ -367,12 +483,28 @@ void detectAndReset()
       pixels.setPixelColor(0, ledColors[i]);
       pixels.show();
 
-      ResetCartridge(addresses[i], colors[i]);
+      ResetResult result = ResetCartridge(addresses[i], colors[i]);
+      if (result == RESET_OK)
+      {
+        Serial.println("Reset successful. Insert another cartridge of the same color into the printer");
+        Serial.println("before this one, otherwise the printer restores its remembered level.");
+        delay(2000);
+      }
+      else if (result == RESET_END_OF_LIFE)
+      {
+        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // Solid red: end of life, nothing written
+        pixels.show();
+        delay(5000);
+      }
+      else
+      {
+        Serial.println("RESET FAILED. The cartridge may not have been reset completely.");
+        blinkLed(pixels.Color(255, 0, 0), 20, 125); // Fast red blink: reset failed
+      }
 
-      delay(2000);
       pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // Green
       pixels.show();
-      return; // Found and reset, so we are done.
+      return; // Found and processed, so we are done.
     }
     else
     {
@@ -381,19 +513,163 @@ void detectAndReset()
     }
   }
 
-  if (!found) {
-    Serial.println("No cartridge detected.");
-    for (int i = 0; i < 5; i++) {
-      pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // Red
-      pixels.show();
-      delay(500);
-      pixels.setPixelColor(0, pixels.Color(0, 0, 0)); // Off
-      pixels.show();
-      delay(500);
-    }
-    pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // Green
-    pixels.show();
+  Serial.println("No cartridge detected.");
+  blinkLed(pixels.Color(255, 0, 0), 5, 500); // Slow red blink: no cartridge
+  pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // Green
+  pixels.show();
+}
+
+// -----------------------------------------------------------------
+// READ-ONLY DIAGNOSTICS (serial commands)
+// Nothing below writes to the chip: every access uses the read command REG_ADDR_1.
+// -----------------------------------------------------------------
+
+void dumpDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint8_t regAddr3, uint16_t dataSize, bool hasCrc)
+{
+  Serial.printf("--- 0x%X : 0x%02X 0x%02X 0x%02X, %u bytes ---\n", slaveAddress, REG_ADDR_1, regAddr2, regAddr3, dataSize);
+  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, regAddr3, Buffer, dataSize);
+  delay(10);
+  if (bRet && hasCrc && hasValidCrc(Buffer, dataSize))
+    Serial.println("CRC OK");
+}
+
+/**
+ * @brief Dumps the known blocks of every cartridge chip that answers, without writing.
+ */
+void dumpCartridges()
+{
+  const uint16_t addresses[] = {BLACK_CHIP_ADDRESS, CYAN_CHIP_ADDRESS, MAGENTA_CHIP_ADDRESS, YELLOW_CHIP_ADDRESS};
+  const char *colors[] = {"Black", "Cyan", "Magenta", "Yellow"};
+  bool found = false;
+
+  for (int i = 0; i < 4; i++)
+  {
+    if (!read_TI046B1_register(addresses[i], REG_ADDR_1, REG_ADDR_2_SERIAL, REG_ADDR_3_SERIAL, Buffer, 1))
+      continue;
+    found = true;
+    Serial.printf("=== DUMP %s (0x%X) ===\n", colors[i], addresses[i]);
+    dumpDataBlock(addresses[i], REG_ADDR_2_SERIAL, REG_ADDR_3_SERIAL, SERIAL_NUMBER_SIZE, false);
+    dumpDataBlock(addresses[i], REG_ADDR_2_56_1, REG_ADDR_3_RW, DATA_BLOCK_56_SIZE, true);
+    dumpDataBlock(addresses[i], REG_ADDR_2_56_2, REG_ADDR_3_RW, DATA_BLOCK_56_SIZE, true);
+    dumpDataBlock(addresses[i], REG_ADDR_2_208, REG_ADDR_3_RW, DATA_BLOCK_208_SIZE, true);
+    dumpDataBlock(addresses[i], CHIP_ID_COPY_ADDR & 0xFF, CHIP_ID_COPY_ADDR >> 8, CHIP_ID_COPY_SIZE, false);
+    Serial.printf("=== END DUMP %s ===\n", colors[i]);
   }
+  if (!found)
+    Serial.println("No cartridge detected.");
+}
+
+// Blocks the "w" command may write; the data must always be a whole block
+struct WritableBlock
+{
+  uint16_t address;
+  uint16_t size;
+  bool hasCrc;
+};
+const WritableBlock WRITABLE_BLOCKS[] = {
+    {REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, true},
+    {REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, true},
+    {REG_ADDR_2_208, DATA_BLOCK_208_SIZE, true},
+    {CHIP_ID_COPY_ADDR, CHIP_ID_COPY_SIZE, false},
+};
+
+/**
+ * @brief Writes one whole block from hex data and verifies it by reading it back.
+ * Used to restore a chip from a saved image, e.g. after the printer corrupted it.
+ */
+bool writeBlockCommand(uint16_t slaveAddress, uint16_t address, const char *hex)
+{
+  const WritableBlock *block = NULL;
+  for (const WritableBlock &candidate : WRITABLE_BLOCKS)
+    if (candidate.address == address)
+      block = &candidate;
+  if (block == NULL)
+  {
+    Serial.println("Not the start of a writable block (20, 58, 90 or 160).");
+    return false;
+  }
+
+  if (strlen(hex) != block->size * 2u)
+  {
+    Serial.printf("Expected %u bytes of hex data, got %u characters.\n", block->size, strlen(hex));
+    return false;
+  }
+  for (uint16_t i = 0; i < block->size; i++)
+  {
+    char byteHex[3] = {hex[2 * i], hex[2 * i + 1], 0};
+    char *end;
+    Buffer[i] = strtoul(byteHex, &end, 16);
+    if (*end != 0 || !isxdigit(byteHex[0]))
+    {
+      Serial.println("Invalid hex data.");
+      return false;
+    }
+  }
+  if (block->hasCrc && !hasValidCrc(Buffer, block->size))
+  {
+    Serial.println("Refusing to write a block with an invalid CRC.");
+    return false;
+  }
+
+  uint8_t expected[DATA_BLOCK_208_SIZE];
+  memcpy(expected, Buffer, block->size);
+  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, address & 0xFF, address >> 8, BufferPlus4, block->size))
+    return false;
+  delay(10);
+  if (!readChip(slaveAddress, address, Buffer, block->size))
+    return false;
+  if (memcmp(expected, Buffer, block->size) != 0)
+  {
+    Serial.println("Verification failed : read-back data differs from written data.");
+    return false;
+  }
+  Serial.println("Verify OK");
+  return true;
+}
+
+/**
+ * @brief Handles one serial command line:
+ *   d                         dump all known blocks of the connected chip(s)
+ *   r <addr> <reg2> <reg3> <len>  raw read, all values hex (e.g. "r 2 20 0 38")
+ *   w <addr> <block> <data>   write one whole block (20, 58, 90 or 160) from hex data, verified
+ */
+void handleSerialCommand()
+{
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0)
+    return;
+
+  unsigned int addr, reg2, reg3, len;
+  int dataStart = -1;
+  if (line == "d")
+  {
+    dumpCartridges();
+  }
+  else if (sscanf(line.c_str(), "r %x %x %x %x", &addr, &reg2, &reg3, &len) == 4)
+  {
+    if (addr > 0x3FF || reg2 > 0xFF || reg3 > 0xFF || len == 0 || len > 512)
+      Serial.println("Out of range : addr <= 3FF, reg2/reg3 <= FF, 0 < len <= 200 (hex)");
+    else
+      dumpDataBlock(addr, reg2, reg3, len, false);
+  }
+  else if (sscanf(line.c_str(), "w %x %x %n", &addr, &reg2, &dataStart) == 2 && dataStart > 0)
+  {
+    if (addr > 0x3FF)
+      Serial.println("Out of range : addr <= 3FF");
+    else
+      writeBlockCommand(addr, reg2, line.c_str() + dataStart);
+  }
+  else
+  {
+    Serial.println("Commands : d | r <addr> <reg2> <reg3> <len> | w <addr> <block> <data> (hex)");
+  }
+  Serial.println("End command.");
+}
+
+bool isButtonPressed()
+{
+  return digitalRead(BUTTON_PIN) == BUTTON_ACTIVE_LEVEL;
 }
 
 /**
@@ -402,12 +678,18 @@ void detectAndReset()
 void setup()
 {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  // Native USB (e.g. ESP32-S2): give the host a moment to open the port so the banner is not lost
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 2000)
+    delay(10);
+#endif
   Serial.println("----- I2C Reset of the TI046B1 CHIPS ------");
   Serial.println("-------------------------------------------");
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(34, INPUT);
-  randomSeed(analogRead(34));
+  pinMode(BUTTON_PIN, BUTTON_ACTIVE_LEVEL == LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  // No randomSeed() on purpose: without it random() uses the ESP32 hardware RNG
+  // (esp_random), calling it would switch to the weaker software rand().
 
   pixels.begin();
   pixels.setPixelColor(0, pixels.Color(0, 255, 0)); // Green
@@ -415,24 +697,37 @@ void setup()
 
   // Set the I2C buffer size to 1024 bytes (must be called BEFORE Wire.begin())
   Wire.setBufferSize(1024);
-  // Default ESP32 pins are SDA=21, SCL=22
-  Wire.begin();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   // Set I2C clock to 100 kHz, matching the original TWI_FREQ
   Wire.setClock(100000);
 
+  Serial.printf("Button on GPIO %d is %s (active %s)\n", BUTTON_PIN, isButtonPressed() ? "PRESSED - check the wiring" : "released", BUTTON_ACTIVE_LEVEL == HIGH ? "HIGH" : "LOW");
   Serial.println("Ready to reset. Press the button.");
 }
 void loop()
 {
-  if (digitalRead(BUTTON_PIN) == LOW)
+  if (Serial.available())
+    handleSerialCommand();
+
+  // A press only counts after the button has been seen released, so a button
+  // that already reads as pressed at boot (or is still held after a reset)
+  // never starts a write by itself.
+  static bool buttonArmed = false;
+  if (!isButtonPressed())
   {
-    delay(50); // Debounce
-    if (digitalRead(BUTTON_PIN) == LOW)
-    {
-      Serial.println("Button pressed. Begin reset op.");
-      detectAndReset();
-      Serial.println("End reset op.");
-    }
+    buttonArmed = true;
+    return;
+  }
+  if (!buttonArmed)
+    return;
+
+  delay(50); // Debounce
+  if (isButtonPressed())
+  {
+    buttonArmed = false;
+    Serial.println("Button pressed. Begin reset op.");
+    detectAndReset();
+    Serial.println("End reset op.");
   }
 }
