@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
+#include <nvs.h>
 
 // Pins are set per board in platformio.ini (build_flags), defaults match the LOLIN S2 Mini
 #ifndef BUTTON_PIN
@@ -52,6 +54,26 @@ const uint16_t DATA_BLOCK_208_SIZE = 208;
 const uint16_t CHIP_ID_COPY_ADDR = 0x160;
 const uint16_t CHIP_ID_SIZE = 6;
 const uint16_t CHIP_ID_COPY_SIZE = 16;
+
+// The writable blocks of a chip. A chip image (backup) is these blocks
+// concatenated in this order.
+struct WritableBlock
+{
+  uint16_t address;
+  uint16_t size;
+  bool hasCrc;
+};
+const WritableBlock WRITABLE_BLOCKS[] = {
+    {REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, true},
+    {REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, true},
+    {REG_ADDR_2_208, DATA_BLOCK_208_SIZE, true},
+    {CHIP_ID_COPY_ADDR, CHIP_ID_COPY_SIZE, false},
+};
+const size_t CHIP_IMAGE_SIZE = DATA_BLOCK_56_SIZE * 2 + DATA_BLOCK_208_SIZE + CHIP_ID_COPY_SIZE;
+
+// Chip images saved before every reset live in the ESP32's NVS flash, one
+// entry per cartridge serial number, so a chip the printer corrupts can be restored.
+const char *BACKUP_NAMESPACE = "backups";
 
 // Global buffer setup, identical to the original
 uint8_t BufferPlus4[1024 + 4];
@@ -126,7 +148,7 @@ bool checkI2CResult(uint8_t nRet, const char *operation)
  * @brief Reads data from a 10-bit I2C address using a repeated start.
  * Rewritten for ESP32 Wire library.
  */
-bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegisterByte, uint8_t secondRegisterByte, uint8_t thirdRegisterByte, uint8_t *destinationBuffer, uint16_t readSize)
+bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegisterByte, uint8_t secondRegisterByte, uint8_t thirdRegisterByte, uint8_t *destinationBuffer, uint16_t readSize, bool verbose = true)
 {
 
   // 10-bit address splitting logic
@@ -161,7 +183,9 @@ bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegister
   // Check if we got all the bytes we asked for
   if (bytesRead == 0)
   {
-    Serial.println("I2C error while trying to read from the slave : no data (no ACK, timeout or bus error).");
+    // Not verbose: used to probe for chips, an empty slot is expected then
+    if (verbose)
+      Serial.println("I2C error while trying to read from the slave : no data (no ACK, timeout or bus error).");
     return false;
   }
 
@@ -179,6 +203,8 @@ bool read_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegister
   Wire.readBytes(destinationBuffer, readSize);
 
   // --- Printing ---
+  if (!verbose)
+    return true;
   Serial.print("uint8_t destinationBuffer[");
   Serial.print(readSize);
   Serial.print("] = {");
@@ -236,38 +262,141 @@ bool write_TI046B1_register(uint16_t TenBits_slave_address, uint8_t firstRegiste
 // They are copied directly from the original .ino file
 // -----------------------------------------------------------------
 
-bool readChip(uint16_t slaveAddress, uint16_t address, uint8_t *destination, uint16_t size)
+bool readChip(uint16_t slaveAddress, uint16_t address, uint8_t *destination, uint16_t size, bool verbose = true)
 {
-  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, address & 0xFF, address >> 8, destination, size);
+  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, address & 0xFF, address >> 8, destination, size, verbose);
   delay(10);
   return bRet;
 }
 
 /**
- * @brief Checks whether the printer has marked the cartridge as end of life.
- * When a cartridge is used up, the printer overwrites the model fields of the
- * 56-byte blocks (bytes 21-24) and the chip ID copy at 0x160 with 0xFF, and it
- * keeps the cartridge as "End of Life" in its own memory, keyed by the
- * read-only serial number. A reset cannot undo that, and resetting such a chip
- * makes the printer report it as "Missing or Defective".
- * @return false if the markers could not be read
+ * @brief Reads every writable block into one chip image (WRITABLE_BLOCKS order).
  */
-bool readEndOfLifeMarkers(uint16_t slaveAddress, bool &endOfLife)
+bool readChipImage(uint16_t slaveAddress, uint8_t *image, bool verbose)
 {
-  uint8_t block56[DATA_BLOCK_56_SIZE];
-  if (!readChip(slaveAddress, REG_ADDR_2_56_1, block56, DATA_BLOCK_56_SIZE))
-    return false;
+  size_t offset = 0;
+  for (const WritableBlock &block : WRITABLE_BLOCKS)
+  {
+    if (!readChip(slaveAddress, block.address, image + offset, block.size, verbose))
+      return false;
+    offset += block.size;
+  }
+  return true;
+}
+
+/**
+ * @brief Checks the CRC of every block of a chip image that carries one.
+ */
+bool chipImageHasValidCrcs(const uint8_t *image)
+{
+  size_t offset = 0;
+  bool valid = true;
+  for (const WritableBlock &block : WRITABLE_BLOCKS)
+  {
+    if (block.hasCrc && !hasValidCrc(image + offset, block.size))
+      valid = false;
+    offset += block.size;
+  }
+  return valid;
+}
+
+enum ChipState
+{
+  CHIP_OK,
+  CHIP_END_OF_LIFE,
+  CHIP_DAMAGED,
+};
+
+/**
+ * @brief Tells whether a chip image may be reset.
+ * - CHIP_DAMAGED: a data block has a bad CRC. Either the read was bad, or the
+ *   printer invalidated the chip (it then reports "Defective"): it does that when
+ *   a reset cartridge is reinserted without another cartridge of the same color
+ *   in between, and fills the blocks with 0xFF. Such a chip is not end of life
+ *   and can be restored from a backup or rebuilt (see README).
+ * - CHIP_END_OF_LIFE: the CRCs are valid but the printer has overwritten the
+ *   model fields of the 56-byte blocks (bytes 21-24) or the chip ID copy at
+ *   0x160 with 0xFF. It keeps the cartridge as "End of Life" in its own memory,
+ *   keyed by the read-only serial number, and a reset cannot undo that.
+ */
+ChipState classifyChipImage(const uint8_t *image)
+{
+  if (!chipImageHasValidCrcs(image))
+    return CHIP_DAMAGED;
+
+  const uint8_t *block56 = image;
   bool modelMarked = block56[20] == 0xFF && block56[21] == 0xFF && block56[22] == 0xFF && block56[23] == 0xFF;
 
-  uint8_t idCopy[CHIP_ID_COPY_SIZE];
-  if (!readChip(slaveAddress, CHIP_ID_COPY_ADDR, idCopy, CHIP_ID_COPY_SIZE))
-    return false;
+  const uint8_t *idCopy = image + CHIP_IMAGE_SIZE - CHIP_ID_COPY_SIZE;
   bool idMarked = true;
   for (int i = 0; i < CHIP_ID_SIZE; i++)
     if (idCopy[i] != 0xFF)
       idMarked = false;
 
-  endOfLife = modelMarked || idMarked;
+  return (modelMarked || idMarked) ? CHIP_END_OF_LIFE : CHIP_OK;
+}
+
+/**
+ * @brief Builds the NVS key of a cartridge from its serial number (at most 15 characters).
+ */
+void backupKey(const char *serial, char *key)
+{
+  size_t i = 0;
+  for (; i < SERIAL_NUMBER_SIZE && serial[i] != 0; i++)
+    key[i] = isalnum((unsigned char)serial[i]) ? serial[i] : '_';
+  key[i] = 0;
+}
+
+/**
+ * @brief Saves a chip image in flash under the cartridge serial number,
+ * replacing an older backup of the same cartridge.
+ */
+bool saveBackup(const char *serial, const uint8_t *image)
+{
+  char key[SERIAL_NUMBER_SIZE + 1];
+  backupKey(serial, key);
+  Preferences prefs;
+  if (!prefs.begin(BACKUP_NAMESPACE, false))
+    return false;
+  size_t written = prefs.putBytes(key, image, CHIP_IMAGE_SIZE);
+  prefs.end();
+  return written == CHIP_IMAGE_SIZE;
+}
+
+/**
+ * @brief Loads the chip image saved for a cartridge serial number.
+ */
+bool loadBackup(const char *serial, uint8_t *image)
+{
+  char key[SERIAL_NUMBER_SIZE + 1];
+  backupKey(serial, key);
+  Preferences prefs;
+  if (!prefs.begin(BACKUP_NAMESPACE, true))
+    return false;
+  bool found = prefs.getBytesLength(key) == CHIP_IMAGE_SIZE && prefs.getBytes(key, image, CHIP_IMAGE_SIZE) == CHIP_IMAGE_SIZE;
+  prefs.end();
+  return found;
+}
+
+/**
+ * @brief Writes one whole block and verifies it by reading it back.
+ * The data must already be in Buffer.
+ */
+bool writeAndVerifyBlock(uint16_t slaveAddress, uint16_t address, uint16_t size)
+{
+  uint8_t expected[DATA_BLOCK_208_SIZE];
+  memcpy(expected, Buffer, size);
+  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, address & 0xFF, address >> 8, BufferPlus4, size))
+    return false;
+  delay(10);
+  if (!readChip(slaveAddress, address, Buffer, size))
+    return false;
+  if (memcmp(expected, Buffer, size) != 0)
+  {
+    Serial.println("Verification failed : read-back data differs from written data.");
+    return false;
+  }
+  Serial.println("Verify OK");
   return true;
 }
 
@@ -347,24 +476,9 @@ bool processDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint16_t dataSize
 
     resetFunc(Buffer);
 
-    // Keep a copy of what we write, the verification read overwrites Buffer
-    uint8_t expected[DATA_BLOCK_208_SIZE];
-    memcpy(expected, Buffer, dataSize);
-
-    if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, regAddr2, REG_ADDR_3_RW, BufferPlus4, dataSize)) return false;
-    delay(10);
-
-    bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, regAddr2, REG_ADDR_3_RW, Buffer, dataSize);
-    delay(10);
-    if (bRet == false) return false;
-
-    if (memcmp(expected, Buffer, dataSize) != 0) {
-        Serial.println("Verification failed : read-back data differs from written data.");
-        return false;
-    }
-    Serial.println("Verify OK");
+    bool written = writeAndVerifyBlock(slaveAddress, regAddr2, dataSize);
     Serial.println("");
-    return true;
+    return written;
 }
 
 enum ResetResult
@@ -372,34 +486,52 @@ enum ResetResult
   RESET_OK,
   RESET_FAILED,
   RESET_END_OF_LIFE,
+  RESET_DAMAGED,
 };
 
 /**
  * @brief Resets all data blocks of one cartridge.
+ * Saves a backup of the chip in flash first and writes nothing if that fails.
  * Stops at the first failing block so a broken transfer is not followed by more writes.
- * Writes nothing to a cartridge the printer has marked as end of life.
+ * Writes nothing to a cartridge that is damaged or marked as end of life.
  * @return RESET_OK only if every block was written and verified
  */
 ResetResult ResetCartridge(uint16_t slaveAddress, const char *colorName)
 {
-  bool bRet = read_TI046B1_register(slaveAddress, REG_ADDR_1, REG_ADDR_2_SERIAL, REG_ADDR_3_SERIAL, Buffer, SERIAL_NUMBER_SIZE);
-  delay(10);
-  if (bRet == false)
+  char serial[SERIAL_NUMBER_SIZE + 1];
+  if (!readChip(slaveAddress, (REG_ADDR_3_SERIAL << 8) | REG_ADDR_2_SERIAL, (uint8_t *)serial, SERIAL_NUMBER_SIZE))
     return RESET_FAILED;
-  Buffer[SERIAL_NUMBER_SIZE] = 0x00;
+  serial[SERIAL_NUMBER_SIZE] = 0x00;
   Serial.print(colorName);
   Serial.print(" serial number : ");
-  Serial.println((char *)Buffer);
+  Serial.println(serial);
 
-  bool endOfLife;
-  if (!readEndOfLifeMarkers(slaveAddress, endOfLife))
+  uint8_t image[CHIP_IMAGE_SIZE];
+  if (!readChipImage(slaveAddress, image, true))
     return RESET_FAILED;
-  if (endOfLife)
+
+  switch (classifyChipImage(image))
   {
+  case CHIP_DAMAGED:
+    Serial.println("A data block has an invalid CRC. Either the read failed (check the wiring and try again), or the");
+    Serial.println("printer invalidated the chip (it then reports it as defective). Nothing was written.");
+    Serial.println("Restore it with \"restore <addr>\" if a backup exists (\"b\" lists them), otherwise see the README.");
+    return RESET_DAMAGED;
+  case CHIP_END_OF_LIFE:
     Serial.println("This cartridge has reached END OF LIFE: the printer keeps it as empty, keyed by its serial number.");
     Serial.println("A reset cannot change that and would make the printer report it as defective. Nothing was written.");
     return RESET_END_OF_LIFE;
+  case CHIP_OK:
+    break;
   }
+
+  if (!saveBackup(serial, image))
+  {
+    Serial.println("Could not save the backup of this chip in flash (storage full?). Nothing was written.");
+    Serial.println("List the backups with \"b\" and delete old ones with \"forget <serial>\".");
+    return RESET_FAILED;
+  }
+  Serial.println("Backup of the chip saved in flash.");
 
   Serial.print(colorName);
   Serial.print(", (0x");
@@ -490,9 +622,9 @@ void detectAndReset()
         Serial.println("before this one, otherwise the printer restores its remembered level.");
         delay(2000);
       }
-      else if (result == RESET_END_OF_LIFE)
+      else if (result == RESET_END_OF_LIFE || result == RESET_DAMAGED)
       {
-        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // Solid red: end of life, nothing written
+        pixels.setPixelColor(0, pixels.Color(255, 0, 0)); // Solid red: end of life or damaged, nothing written
         pixels.show();
         delay(5000);
       }
@@ -534,6 +666,49 @@ void dumpDataBlock(uint16_t slaveAddress, uint8_t regAddr2, uint8_t regAddr3, ui
 }
 
 /**
+ * @brief Prints the whole 2 KB address space (0x000-0x7FF) of every chip that
+ * answers as an addressed hex dump, without writing. Meant to be copied from the
+ * serial monitor and shared, e.g. to compare chips of different regions.
+ */
+void dumpFullCartridges()
+{
+  const uint16_t addresses[] = {BLACK_CHIP_ADDRESS, CYAN_CHIP_ADDRESS, MAGENTA_CHIP_ADDRESS, YELLOW_CHIP_ADDRESS};
+  const char *colors[] = {"Black", "Cyan", "Magenta", "Yellow"};
+  const uint16_t CHIP_MEMORY_SIZE = 0x800;
+  const uint16_t CHUNK_SIZE = 0x80;
+  bool found = false;
+
+  for (int i = 0; i < 4; i++)
+  {
+    if (!readChip(addresses[i], (REG_ADDR_3_SERIAL << 8) | REG_ADDR_2_SERIAL, Buffer, SERIAL_NUMBER_SIZE, false))
+      continue;
+    found = true;
+    Buffer[SERIAL_NUMBER_SIZE] = 0x00;
+    Serial.printf("=== FULL DUMP %s (0x%X) serial %s ===\n", colors[i], addresses[i], (char *)Buffer);
+
+    for (uint16_t chunk = 0; chunk < CHIP_MEMORY_SIZE; chunk += CHUNK_SIZE)
+    {
+      bool bRet = readChip(addresses[i], chunk, Buffer, CHUNK_SIZE, false);
+      for (uint16_t line = 0; line < CHUNK_SIZE; line += 16)
+      {
+        Serial.printf("%04X:", chunk + line);
+        if (!bRet)
+        {
+          Serial.println(" read failed");
+          continue;
+        }
+        for (uint16_t j = 0; j < 16; j++)
+          Serial.printf(" %02X", Buffer[line + j]);
+        Serial.println();
+      }
+    }
+    Serial.printf("=== END FULL DUMP %s ===\n", colors[i]);
+  }
+  if (!found)
+    Serial.println("No cartridge detected.");
+}
+
+/**
  * @brief Dumps the known blocks of every cartridge chip that answers, without writing.
  */
 void dumpCartridges()
@@ -558,20 +733,6 @@ void dumpCartridges()
   if (!found)
     Serial.println("No cartridge detected.");
 }
-
-// Blocks the "w" command may write; the data must always be a whole block
-struct WritableBlock
-{
-  uint16_t address;
-  uint16_t size;
-  bool hasCrc;
-};
-const WritableBlock WRITABLE_BLOCKS[] = {
-    {REG_ADDR_2_56_1, DATA_BLOCK_56_SIZE, true},
-    {REG_ADDR_2_56_2, DATA_BLOCK_56_SIZE, true},
-    {REG_ADDR_2_208, DATA_BLOCK_208_SIZE, true},
-    {CHIP_ID_COPY_ADDR, CHIP_ID_COPY_SIZE, false},
-};
 
 /**
  * @brief Writes one whole block from hex data and verifies it by reading it back.
@@ -610,28 +771,108 @@ bool writeBlockCommand(uint16_t slaveAddress, uint16_t address, const char *hex)
     Serial.println("Refusing to write a block with an invalid CRC.");
     return false;
   }
+  return writeAndVerifyBlock(slaveAddress, address, block->size);
+}
 
-  uint8_t expected[DATA_BLOCK_208_SIZE];
-  memcpy(expected, Buffer, block->size);
-  if (!write_TI046B1_register(slaveAddress, REG_ADDR_1_WRITE, address & 0xFF, address >> 8, BufferPlus4, block->size))
-    return false;
-  delay(10);
-  if (!readChip(slaveAddress, address, Buffer, block->size))
-    return false;
-  if (memcmp(expected, Buffer, block->size) != 0)
+/**
+ * @brief Writes the backup saved for the connected chip's serial number back to
+ * the chip, block by block with verification. Meant for a chip the printer has
+ * invalidated ("Defective"); the chip's current content is not checked.
+ */
+void restoreCommand(uint16_t slaveAddress)
+{
+  char serial[SERIAL_NUMBER_SIZE + 1];
+  if (!readChip(slaveAddress, (REG_ADDR_3_SERIAL << 8) | REG_ADDR_2_SERIAL, (uint8_t *)serial, SERIAL_NUMBER_SIZE, false))
   {
-    Serial.println("Verification failed : read-back data differs from written data.");
-    return false;
+    Serial.println("No chip answers at this address.");
+    return;
   }
-  Serial.println("Verify OK");
-  return true;
+  serial[SERIAL_NUMBER_SIZE] = 0x00;
+  Serial.printf("Serial number : %s\n", serial);
+
+  uint8_t image[CHIP_IMAGE_SIZE];
+  if (!loadBackup(serial, image))
+  {
+    Serial.println("No backup saved for this serial number. Nothing was written.");
+    return;
+  }
+  if (!chipImageHasValidCrcs(image))
+  {
+    Serial.println("The saved backup has an invalid CRC. Nothing was written.");
+    return;
+  }
+
+  size_t offset = 0;
+  for (const WritableBlock &block : WRITABLE_BLOCKS)
+  {
+    Serial.printf("Restoring block 0x%03X (%u bytes)\n", block.address, block.size);
+    memcpy(Buffer, image + offset, block.size);
+    if (!writeAndVerifyBlock(slaveAddress, block.address, block.size))
+    {
+      Serial.println("RESTORE FAILED. The chip may be only partly restored, run \"restore\" again.");
+      return;
+    }
+    offset += block.size;
+  }
+  Serial.println("Restore complete. Insert another cartridge of the same color into the printer before this one.");
+}
+
+/**
+ * @brief Lists the serial numbers that have a backup saved in flash.
+ */
+void listBackups()
+{
+  int count = 0;
+#if ESP_IDF_VERSION_MAJOR >= 5
+  nvs_iterator_t it = NULL;
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, BACKUP_NAMESPACE, NVS_TYPE_BLOB, &it);
+  while (err == ESP_OK)
+  {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    Serial.println(info.key);
+    count++;
+    err = nvs_entry_next(&it);
+  }
+#else
+  nvs_iterator_t it = nvs_entry_find(NVS_DEFAULT_PART_NAME, BACKUP_NAMESPACE, NVS_TYPE_BLOB);
+  while (it != NULL)
+  {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    Serial.println(info.key);
+    count++;
+    it = nvs_entry_next(it);
+  }
+#endif
+  nvs_release_iterator(it);
+  Serial.printf("%d backup(s) saved.\n", count);
+}
+
+/**
+ * @brief Deletes the backup saved for a serial number.
+ */
+void forgetBackup(const char *serial)
+{
+  char key[SERIAL_NUMBER_SIZE + 1];
+  backupKey(serial, key);
+  Preferences prefs;
+  if (prefs.begin(BACKUP_NAMESPACE, false) && prefs.isKey(key) && prefs.remove(key))
+    Serial.printf("Backup of %s deleted.\n", key);
+  else
+    Serial.printf("No backup saved for %s.\n", key);
+  prefs.end();
 }
 
 /**
  * @brief Handles one serial command line:
  *   d                         dump all known blocks of the connected chip(s)
+ *   f                         full 2 KB hex dump of the connected chip(s)
  *   r <addr> <reg2> <reg3> <len>  raw read, all values hex (e.g. "r 2 20 0 38")
  *   w <addr> <block> <data>   write one whole block (20, 58, 90 or 160) from hex data, verified
+ *   b                         list the chip backups saved in flash
+ *   restore <addr>            write the saved backup back to the chip at <addr>
+ *   forget <serial>           delete the backup of a serial number
  */
 void handleSerialCommand()
 {
@@ -645,6 +886,10 @@ void handleSerialCommand()
   if (line == "d")
   {
     dumpCartridges();
+  }
+  else if (line == "f")
+  {
+    dumpFullCartridges();
   }
   else if (sscanf(line.c_str(), "r %x %x %x %x", &addr, &reg2, &reg3, &len) == 4)
   {
@@ -660,9 +905,27 @@ void handleSerialCommand()
     else
       writeBlockCommand(addr, reg2, line.c_str() + dataStart);
   }
+  else if (line == "b")
+  {
+    listBackups();
+  }
+  else if (sscanf(line.c_str(), "restore %x", &addr) == 1)
+  {
+    if (addr > 0x3FF)
+      Serial.println("Out of range : addr <= 3FF");
+    else
+      restoreCommand(addr);
+  }
+  else if (line.startsWith("forget ") && line.length() > 7)
+  {
+    String serial = line.substring(7);
+    serial.trim();
+    forgetBackup(serial.c_str());
+  }
   else
   {
-    Serial.println("Commands : d | r <addr> <reg2> <reg3> <len> | w <addr> <block> <data> (hex)");
+    Serial.println("Commands : d | f | r <addr> <reg2> <reg3> <len> | w <addr> <block> <data> (hex)");
+    Serial.println("           b | restore <addr> | forget <serial>");
   }
   Serial.println("End command.");
 }
